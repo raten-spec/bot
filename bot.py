@@ -6,6 +6,8 @@ Her çalıştırmada:
   1. İzin verilen (allowlist) her çift için mevcut orta fiyatı okur.
   2. Botun o çiftteki AÇIK emirlerini iptal eder.
   3. Orta fiyatın SPREAD_PCT kadar altına bir alış, üstüne bir satış emri koyar.
+  4. (Canlı modda) gönderilen işlemlerin Hive Engine tarafında KABUL EDİLİP
+     EDİLMEDİĞİNİ kontrol eder ve reddedilenleri loglar.
 
 Güvenlik notları (LÜTFEN OKUYUN):
   - DRY_RUN=true iken hiçbir gerçek emir gönderilmez, sadece ne
@@ -18,11 +20,21 @@ Güvenlik notları (LÜTFEN OKUYUN):
     MAX_ALLOCATION_PCT'sinden fazlasını kullanmaz (bütçe semboller
     arasında eşit bölünür). Satış tarafında her sembol kendi
     bakiyesinin MAX_ALLOCATION_PCT'sini satar.
+
+BUNDLE_MODE (varsayılan: false):
+  - false: her işlem (iptal/alış/satış) ayrı bir Hive transaction'ı olarak
+    hemen gönderilir. Ek token gerektirmez.
+  - true : tüm işlemler tek Hive transaction'ında gönderilir. Hive Engine
+    bunu "multiTransaction" sayar ve ilk işlemden sonrakiler için BEED
+    token'ı ile ücret keser. Hesabınızda BEED yoksa ilk işlem geçer,
+    kalanlar sidechain'de reddedilir. Yalnızca hesapta yeterli BEED varsa açın.
 """
 
 import os
 import sys
+import json
 import math
+import time
 import logging
 
 logging.basicConfig(
@@ -38,6 +50,7 @@ log = logging.getLogger("hive-mm-bot")
 HIVE_ACCOUNT = os.environ.get("HIVE_ACCOUNT", "").strip()
 HIVE_ACTIVE_KEY = os.environ.get("HIVE_ACTIVE_KEY", "").strip()
 DRY_RUN = os.environ.get("DRY_RUN", "true").strip().lower() != "false"
+BUNDLE_MODE = os.environ.get("BUNDLE_MODE", "false").strip().lower() == "true"
 SPREAD_PCT = float(os.environ.get("SPREAD_PCT", "2.0"))          # her yönde %
 ORDER_SIZE_QUOTE = float(os.environ.get("ORDER_SIZE_QUOTE", "1"))  # SWAP.HIVE cinsinden, sembol başına üst sınır
 MAX_ALLOCATION_PCT = float(os.environ.get("MAX_ALLOCATION_PCT", "20"))  # bakiyenin en fazla %'si
@@ -53,6 +66,14 @@ HIVE_NODES = [
     "https://api.deathwing.me",
 ]
 
+# Bundle kapalıyken gönderilen her işlemin (etiket, trx_id) kaydı; sidechain
+# sonucunu sonradan kontrol etmek için tutulur.
+SENT_TXS = []
+# Göndermeye/kuyruğa eklemeye çalışırken alınan hatalar (çıkış kodu için).
+SEND_ERRORS = []
+
+SENT_WORD = "kuyruğa eklendi" if BUNDLE_MODE else "gönderildi"
+
 
 def fail(msg):
     log.error(msg)
@@ -65,23 +86,31 @@ def floor_to(value, precision):
     return math.floor(value * factor + 1e-9) / factor
 
 
+def record_tx(label, tx):
+    """Bundle kapalıyken gönderilen işlemin trx_id'sini sonradan kontrol için saklar."""
+    if BUNDLE_MODE:
+        return None
+    trx_id = tx.get("trx_id") if isinstance(tx, dict) else None
+    if trx_id:
+        SENT_TXS.append((label, trx_id))
+    else:
+        log.warning("%s için trx_id alınamadı, sidechain sonucu kontrol edilemeyecek.", label)
+    return trx_id
+
+
 def load_clients():
     """nectar/nectarengine bağlantısını kurar. Import burada yapılır ki
     eksik bağımlılıkta hata mesajı net olsun.
 
-    bundle=True: bu Hive örneği üzerinden yapılan işlemler (cancel/buy/sell)
-    hemen zincire gönderilmez, kuyruğa eklenir. Tüm semboller işlendikten
-    sonra tek bir hive.broadcast() çağrısıyla HEPSİ tek Hive transaction'ı
-    olarak gönderilir.
+    BUNDLE_MODE=false (varsayılan): her işlem ayrı Hive transaction'ı olarak
+    hemen gönderilir.
 
-    ÖNEMLİ SINIR: Bu paketleme Hive katmanındadır — transaction ya bütünüyle
-    zincire girer ya da hiç girmez. Ama Hive Engine (sidechain) tarafı, bu
-    tek transaction içindeki işlemleri yine de birbirinden BAĞIMSIZ ve
-    SIRAYLA işler. Örn. iptal işlemi tutar ama hemen ardından gelen alış
-    emri bakiye yetersizliğinden sidechain'de reddedilebilir; Hive
-    transaction'ı buna rağmen "başarılı" sayılır. Yani "ya hepsi ya hiçbiri"
-    garantisi sidechain mantığı seviyesinde YOKTUR — sadece tek imza/tek
-    broadcast/garantili sıra kazanılır."""
+    BUNDLE_MODE=true: bundle=True ile işlemler kuyruğa eklenir ve sonunda tek
+    hive.broadcast() ile gönderilir. Hive katmanında ya hep ya hiç geçerlidir,
+    ama Hive Engine bunu multiTransaction sayar: ilk işlemden sonrakiler için
+    BEED ücreti alınır ve sidechain işlemleri birbirinden BAĞIMSIZ işler.
+    BEED yoksa geri kalan işlemler reddedilir, Hive transaction'ı yine de
+    'başarılı' görünür."""
     try:
         from nectar import Hive
         from nectarengine.api import Api
@@ -91,7 +120,7 @@ def load_clients():
         fail("nectar / nectarengine kurulu değil. `pip install -r requirements.txt` çalıştırın.")
 
     keys = [] if DRY_RUN else [HIVE_ACTIVE_KEY]
-    hive = Hive(node=HIVE_NODES, keys=keys, bundle=(not DRY_RUN))
+    hive = Hive(node=HIVE_NODES, keys=keys, bundle=(BUNDLE_MODE and not DRY_RUN))
     api = Api()
     market = Market(blockchain_instance=hive)
     wallet = Wallet(HIVE_ACCOUNT, api=api)
@@ -152,10 +181,12 @@ def cancel_open_orders(market, wallet, symbol):
                 log.info("[DRY_RUN] %s %s emri iptal edilirdi (id=%s)", symbol, order_type, oid)
                 continue
             try:
-                market.cancel(HIVE_ACCOUNT, order_type, oid)
-                log.info("%s %s iptali kuyruğa eklendi (id=%s)", symbol, order_type, oid)
+                tx = market.cancel(HIVE_ACCOUNT, order_type, oid)
+                log.info("%s %s iptali %s (id=%s)", symbol, order_type, SENT_WORD, oid)
+                record_tx("%s %s iptali" % (symbol, order_type), tx)
             except Exception as e:
-                log.warning("%s %s emri kuyruğa eklenemedi (id=%s): %r", symbol, order_type, oid, e)
+                log.warning("%s %s iptali gönderilemedi (id=%s): %r", symbol, order_type, oid, e)
+                SEND_ERRORS.append("%s %s iptali" % (symbol, order_type))
 
 
 def get_balance(wallet, symbol):
@@ -187,10 +218,12 @@ def place_quotes(market, wallet, symbol, mid_price, precision, quote_budget):
             log.info("[DRY_RUN] ALIŞ  %s %s @ %s SWAP.HIVE (harcanacak ~%.4f)", buy_amount, symbol, buy_price, spend)
         else:
             try:
-                market.buy(HIVE_ACCOUNT, buy_amount, symbol, buy_price)
-                log.info("ALIŞ kuyruğa eklendi: %s %s @ %s (~%.4f SWAP.HIVE)", buy_amount, symbol, buy_price, spend)
+                tx = market.buy(HIVE_ACCOUNT, buy_amount, symbol, buy_price)
+                log.info("ALIŞ %s: %s %s @ %s (~%.4f SWAP.HIVE)", SENT_WORD, buy_amount, symbol, buy_price, spend)
+                record_tx("%s alış" % symbol, tx)
             except Exception as e:
-                log.error("Alış emri kuyruğa eklenemedi (%s): %r", symbol, e)
+                log.error("Alış emri gönderilemedi (%s): %r", symbol, e)
+                SEND_ERRORS.append("%s alış" % symbol)
     else:
         log.info("%s için alış emri atlandı (bütçe/precision nedeniyle miktar 0).", symbol)
 
@@ -199,12 +232,51 @@ def place_quotes(market, wallet, symbol, mid_price, precision, quote_budget):
             log.info("[DRY_RUN] SATIŞ %s %s @ %s SWAP.HIVE", sell_amount, symbol, sell_price)
         else:
             try:
-                market.sell(HIVE_ACCOUNT, sell_amount, symbol, sell_price)
-                log.info("SATIŞ kuyruğa eklendi: %s %s @ %s", sell_amount, symbol, sell_price)
+                tx = market.sell(HIVE_ACCOUNT, sell_amount, symbol, sell_price)
+                log.info("SATIŞ %s: %s %s @ %s", SENT_WORD, sell_amount, symbol, sell_price)
+                record_tx("%s satış" % symbol, tx)
             except Exception as e:
-                log.error("Satış emri kuyruğa eklenemedi (%s): %r", symbol, e)
+                log.error("Satış emri gönderilemedi (%s): %r", symbol, e)
+                SEND_ERRORS.append("%s satış" % symbol)
     else:
         log.info("%s için satış emri atlandı (yetersiz bakiye).", symbol)
+
+
+def verify_signing_key(hive):
+    """Verilen private key'in, hesabın zincirdeki active (ya da owner) public
+    key'lerinden biriyle eşleşip eşleşmediğini kontrol eder. Böylece
+    MissingKeyError'a broadcast aşamasında değil, işe başlamadan önce ve
+    anlaşılır bir mesajla yakalanır. Private key asla loglanmaz.
+
+    Kontrolün kendisi çalışamazsa (import/API hatası) yalnızca uyarı verir
+    ve devam eder; bu durumda gerçek imza hatası broadcast'te görünür."""
+    try:
+        from nectar.account import Account
+        from nectargraphenebase.account import PrivateKey
+
+        # "STM"/"TST" gibi prefix farklarından etkilenmemek için ilk 3 karakter atılır.
+        my_pub = str(PrivateKey(HIVE_ACTIVE_KEY).pubkey)[3:]
+
+        acc = Account(HIVE_ACCOUNT, blockchain_instance=hive)
+        signing_keys = set()
+        for role in ("active", "owner"):
+            for entry in acc[role]["key_auths"]:
+                signing_keys.add(str(entry[0])[3:])
+        posting_keys = {str(e[0])[3:] for e in acc["posting"]["key_auths"]}
+        memo_key = str(acc["memo_key"])[3:]
+    except Exception as e:
+        log.warning("Anahtar ön kontrolü yapılamadı, devam ediliyor: %r", e)
+        return
+
+    if my_pub in signing_keys:
+        log.info("Anahtar doğrulandı: HIVE_ACTIVE_KEY, %s hesabının active/owner yetkisine ait.", HIVE_ACCOUNT)
+        return
+    if my_pub in posting_keys:
+        fail("HIVE_ACTIVE_KEY olarak bir POSTING key girilmiş. Active private key gerekir.")
+    if my_pub == memo_key:
+        fail("HIVE_ACTIVE_KEY olarak MEMO key girilmiş. Active private key gerekir.")
+    fail("HIVE_ACTIVE_KEY, %s hesabının active/owner key'lerinden hiçbiriyle eşleşmiyor. "
+         "Key'i ve HIVE_ACCOUNT adını kontrol edin (başka bir hesabın key'i olabilir)." % HIVE_ACCOUNT)
 
 
 def pending_op_count(hive):
@@ -216,21 +288,71 @@ def pending_op_count(hive):
         return None
 
 
+def check_sidechain_results(api, tx_ids, wait_rounds=6, wait_secs=5):
+    """Gönderilen işlemlerin Hive Engine (sidechain) tarafında kabul edilip
+    edilmediğini kontrol eder. Hive transaction'ının başarılı olması, emrin
+    kabul edildiği anlamına GELMEZ; reddedilenler burada loglanır.
+
+    tx_ids: [(etiket, sidechain_txid), ...]
+    Dönüş: en az bir işlem reddedildiyse True."""
+    pending = list(tx_ids)
+    rejected = False
+    for _ in range(wait_rounds):
+        time.sleep(wait_secs)
+        still_pending = []
+        for label, txid in pending:
+            try:
+                info = api.get_transaction_info(txid)
+            except Exception as e:
+                log.warning("%s sonucu sorgulanamadı (%s): %r", label, txid, e)
+                still_pending.append((label, txid))
+                continue
+            if not info:
+                still_pending.append((label, txid))  # sidechain henüz işlememiş olabilir
+                continue
+
+            logs = info.get("logs") if isinstance(info, dict) else None
+            if isinstance(logs, str):
+                try:
+                    logs = json.loads(logs)
+                except ValueError:
+                    logs = {"errors": [logs]}
+            errors = logs.get("errors") if isinstance(logs, dict) else None
+            if errors:
+                log.error("Sidechain REDDETTİ: %s (%s): %s", label, txid, "; ".join(str(x) for x in errors))
+                rejected = True
+            else:
+                log.info("Sidechain kabul etti: %s (%s)", label, txid)
+        pending = still_pending
+        if not pending:
+            break
+
+    for label, txid in pending:
+        log.warning("Sidechain sonucu henüz görünmedi: %s (%s). Explorer'dan kontrol edin.", label, txid)
+    return rejected
+
+
 def run():
     if not HIVE_ACCOUNT:
         fail("HIVE_ACCOUNT ortam değişkeni / secret ayarlanmamış.")
     if not DRY_RUN and not HIVE_ACTIVE_KEY:
         fail("DRY_RUN=false iken HIVE_ACTIVE_KEY zorunludur.")
 
-    log.info("Başlıyor. Hesap=%s DRY_RUN=%s SPREAD=%%%s ORDER_SIZE=%s SWAP.HIVE MAX_ALLOC=%%%s",
-             HIVE_ACCOUNT, DRY_RUN, SPREAD_PCT, ORDER_SIZE_QUOTE, MAX_ALLOCATION_PCT)
+    log.info("Başlıyor. Hesap=%s DRY_RUN=%s BUNDLE=%s SPREAD=%%%s ORDER_SIZE=%s SWAP.HIVE MAX_ALLOC=%%%s",
+             HIVE_ACCOUNT, DRY_RUN, BUNDLE_MODE, SPREAD_PCT, ORDER_SIZE_QUOTE, MAX_ALLOCATION_PCT)
     log.info("Allowlist: %s", ", ".join(ALLOWLIST_BASE_SYMBOLS))
     if not DRY_RUN:
-        log.info("Bundle modu aktif: tüm semboller için işlemler tek Hive transaction'ında gönderilecek.")
+        if BUNDLE_MODE:
+            log.info("Bundle modu aktif: işlemler tek Hive transaction'ında gönderilecek (BEED ücreti gerekir).")
+        else:
+            log.info("Bundle kapalı: her işlem ayrı Hive transaction'ı olarak hemen gönderilecek.")
 
     hive, api, market, wallet = load_clients()
+    if not DRY_RUN:
+        verify_signing_key(hive)
     queued_any = False
     failed = False
+    tx_ids = []
 
     # Toplam alış bütçesi: SWAP.HIVE bakiyesinin MAX_ALLOCATION_PCT'si,
     # semboller arasında eşit bölünür. Böylece tüm semboller birlikte bile
@@ -256,35 +378,49 @@ def run():
         precision = get_precision(api, symbol)
         log.info("%s orta fiyat: %s SWAP.HIVE (precision=%s)", symbol, mid, precision)
 
-        # Not: bundle modunda bu iki çağrı zincire hemen gitmez, kuyruğa
-        # eklenir. Sıra korunur: bu sembol için iptaller, alış/satıştan
-        # önce kuyruğa girer.
+        # Sıra korunur: bu sembol için iptaller, alış/satıştan önce gönderilir/kuyruğa girer.
         cancel_open_orders(market, wallet, symbol)
         place_quotes(market, wallet, symbol, mid, precision, per_symbol_budget)
         queued_any = True
 
     if DRY_RUN:
         log.info("[DRY_RUN] Hiçbir şey zincire gönderilmedi.")
-    elif queued_any:
-        count = pending_op_count(hive)
-        if count is not None:
-            log.info("Gönderim öncesi kuyrukta %d işlem var.", count)
-            if count == 0:
-                log.warning("Kuyruk boş görünüyor: market işlemleri bu Hive örneğinin "
-                            "kuyruğuna girmemiş olabilir. Yine de gönderim deneniyor.")
-        log.info("Tüm semboller kuyruğa eklendi, tek transaction olarak gönderiliyor…")
-        try:
-            result = hive.broadcast()
-            trx_id = result.get("trx_id") if isinstance(result, dict) else None
-            log.info("Transaction gönderildi. trx_id=%s", trx_id)
-            log.info("Not: Hive Engine (sidechain) sonucu ayrıca doğrulanmalı; "
-                     "trx_id başarılı Hive girişi demektir, emirlerin kabulü değil.")
-        except Exception as e:
-            # log.exception tam traceback yazar; boş mesajlı istisnalarda da sebep görünür.
-            log.exception("Toplu transaction gönderilemedi: %r", e)
-            failed = True
+    elif BUNDLE_MODE:
+        if queued_any:
+            count = pending_op_count(hive)
+            if count is not None:
+                log.info("Gönderim öncesi kuyrukta %d işlem var.", count)
+                if count == 0:
+                    log.warning("Kuyruk boş görünüyor: market işlemleri bu Hive örneğinin "
+                                "kuyruğuna girmemiş olabilir. Yine de gönderim deneniyor.")
+            log.info("Tüm semboller kuyruğa eklendi, tek transaction olarak gönderiliyor…")
+            try:
+                result = hive.broadcast()
+                trx_id = result.get("trx_id") if isinstance(result, dict) else None
+                log.info("Transaction gönderildi. trx_id=%s", trx_id)
+                if trx_id:
+                    # Hive Engine, çoklu işlemleri trx_id, trx_id-1, trx_id-2 ... olarak ayırır.
+                    n = count if count else 1
+                    tx_ids = [("işlem #%d" % (i + 1), trx_id if i == 0 else "%s-%d" % (trx_id, i))
+                              for i in range(n)]
+            except Exception as e:
+                # log.exception tam traceback yazar; boş mesajlı istisnalarda da sebep görünür.
+                log.exception("Toplu transaction gönderilemedi: %r", e)
+                failed = True
+        else:
+            log.info("Kuyruğa eklenecek bir şey olmadı, transaction gönderilmedi.")
     else:
-        log.info("Kuyruğa eklenecek bir şey olmadı, transaction gönderilmedi.")
+        tx_ids = list(SENT_TXS)
+        log.info("Ayrı ayrı gönderilen işlem sayısı: %d", len(tx_ids))
+
+    if tx_ids:
+        log.info("Hive Engine tarafındaki sonuç kontrol ediliyor…")
+        if check_sidechain_results(api, tx_ids):
+            failed = True
+
+    if SEND_ERRORS:
+        log.error("Gönderilemeyen işlemler: %s", ", ".join(SEND_ERRORS))
+        failed = True
 
     log.info("Tamamlandı.")
     if failed:
