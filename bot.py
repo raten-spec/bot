@@ -89,23 +89,36 @@ def load_clients():
 
 
 def get_mid_price(api, symbol):
-    """Sembol/SWAP.HIVE emir defterinden en iyi alış ve satışın ortasını döndürür."""
-    buy_book = api.find_one("market", "buyBook", query={"symbol": symbol}, limit=1)
-    sell_book = api.find_one("market", "sellBook", query={"symbol": symbol}, limit=1)
+    """Sembol/SWAP.HIVE emir defterinden en iyi alış ve satışın ortasını döndürür.
 
-    if not buy_book or not sell_book:
+    api.find_one() 'limit' parametresi almaz ve tek bir dict (ya da None)
+    döner — liste değil. En iyi fiyatı garanti almak için (sıralama
+    belirtilmeden find_one hangi kaydı döndüreceğini garanti etmez)
+    api.find() 'i limit=1 ve doğru sıralama indexi ile kullanıyoruz:
+    buyBook için en yüksek fiyat, sellBook için en düşük fiyat en iyisidir.
+    """
+    buy_orders = api.find(
+        "market", "buyBook", query={"symbol": symbol},
+        limit=1, indexes=[{"index": "price", "descending": True}],
+    )
+    sell_orders = api.find(
+        "market", "sellBook", query={"symbol": symbol},
+        limit=1, indexes=[{"index": "price", "descending": False}],
+    )
+
+    if not buy_orders or not sell_orders:
         return None
 
-    best_bid = float(buy_book[0]["price"])
-    best_ask = float(sell_book[0]["price"])
+    best_bid = float(buy_orders[0]["price"])
+    best_ask = float(sell_orders[0]["price"])
     return (best_bid + best_ask) / 2.0
 
 
 def get_precision(api, symbol):
-    info = api.find_one("tokens", "tokens", query={"symbol": symbol}, limit=1)
+    info = api.find_one("tokens", "tokens", query={"symbol": symbol})
     if not info:
         return 8
-    return int(info[0]["precision"])
+    return int(info["precision"])
 
 
 def cancel_open_orders(market, wallet, symbol):
