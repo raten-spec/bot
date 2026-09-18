@@ -21,13 +21,22 @@ Güvenlik notları (LÜTFEN OKUYUN):
     arasında eşit bölünür). Satış tarafında her sembol kendi
     bakiyesinin MAX_ALLOCATION_PCT'sini satar.
 
+Hive Engine ücret kuralı (hivesmartcontracts, 28 Mayıs 2025'ten beri):
+  Bir kullanıcı için her Hive bloğunda İLK market işlemi ücretsizdir; aynı
+  bloktaki her ek market işlemi 0.001 BEED keser. Hesapta BEED yoksa ek
+  işlemler sidechain'de "multiTransaction fee" hatasıyla reddedilir.
+
+SEND_DELAY_SECS (varsayılan: 6):
+  Bundle kapalıyken iki işlem arasında en az bu kadar saniye beklenir. Hive
+  bloğu 3 saniyedir; 6 saniye her işlemin ayrı bir bloğa düşmesini, dolayısıyla
+  ek ücret ödememeyi sağlar.
+
 BUNDLE_MODE (varsayılan: false):
-  - false: her işlem (iptal/alış/satış) ayrı bir Hive transaction'ı olarak
-    hemen gönderilir. Ek token gerektirmez.
-  - true : tüm işlemler tek Hive transaction'ında gönderilir. Hive Engine
-    bunu "multiTransaction" sayar ve ilk işlemden sonrakiler için BEED
-    token'ı ile ücret keser. Hesabınızda BEED yoksa ilk işlem geçer,
-    kalanlar sidechain'de reddedilir. Yalnızca hesapta yeterli BEED varsa açın.
+  - false: her işlem (iptal/alış/satış) ayrı bir Hive transaction'ı olarak,
+    SEND_DELAY_SECS aralıkla gönderilir. BEED gerekmez.
+  - true : tüm işlemler tek Hive transaction'ında (yani tek blokta)
+    gönderilir. İlk işlem dışındakiler BEED ücreti keser. Yalnızca hesapta
+    yeterli BEED varsa açın.
 """
 
 import os
@@ -51,6 +60,7 @@ HIVE_ACCOUNT = os.environ.get("HIVE_ACCOUNT", "").strip()
 HIVE_ACTIVE_KEY = os.environ.get("HIVE_ACTIVE_KEY", "").strip()
 DRY_RUN = os.environ.get("DRY_RUN", "true").strip().lower() != "false"
 BUNDLE_MODE = os.environ.get("BUNDLE_MODE", "false").strip().lower() == "true"
+SEND_DELAY_SECS = float(os.environ.get("SEND_DELAY_SECS", "6"))  # ardışık işlemler arası minimum bekleme
 SPREAD_PCT = float(os.environ.get("SPREAD_PCT", "2.0"))          # her yönde %
 ORDER_SIZE_QUOTE = float(os.environ.get("ORDER_SIZE_QUOTE", "1"))  # SWAP.HIVE cinsinden, sembol başına üst sınır
 MAX_ALLOCATION_PCT = float(os.environ.get("MAX_ALLOCATION_PCT", "20"))  # bakiyenin en fazla %'si
@@ -84,6 +94,24 @@ def floor_to(value, precision):
     """Değeri aşağı yuvarlar (yukarı yuvarlayıp bütçeyi aşmamak için)."""
     factor = 10 ** precision
     return math.floor(value * factor + 1e-9) / factor
+
+
+_last_send_at = None
+
+
+def pace():
+    """Bir önceki işlemden bu yana SEND_DELAY_SECS geçmediyse bekler. Her işlem
+    ayrı bir Hive bloğuna düşsün, aynı blokta ikinci market işlemi için BEED
+    ücreti kesilmesin diye her gönderimden hemen önce çağrılır. Bundle
+    modunda işlemler zaten tek blokta gider, bu yüzden bekleme yapılmaz."""
+    global _last_send_at
+    if BUNDLE_MODE:
+        return
+    if _last_send_at is not None:
+        wait = SEND_DELAY_SECS - (time.monotonic() - _last_send_at)
+        if wait > 0:
+            time.sleep(wait)
+    _last_send_at = time.monotonic()
 
 
 def record_tx(label, tx):
@@ -180,6 +208,7 @@ def cancel_open_orders(market, wallet, symbol):
             if DRY_RUN:
                 log.info("[DRY_RUN] %s %s emri iptal edilirdi (id=%s)", symbol, order_type, oid)
                 continue
+            pace()
             try:
                 tx = market.cancel(HIVE_ACCOUNT, order_type, oid)
                 log.info("%s %s iptali %s (id=%s)", symbol, order_type, SENT_WORD, oid)
@@ -217,6 +246,7 @@ def place_quotes(market, wallet, symbol, mid_price, precision, quote_budget):
         if DRY_RUN:
             log.info("[DRY_RUN] ALIŞ  %s %s @ %s SWAP.HIVE (harcanacak ~%.4f)", buy_amount, symbol, buy_price, spend)
         else:
+            pace()
             try:
                 tx = market.buy(HIVE_ACCOUNT, buy_amount, symbol, buy_price)
                 log.info("ALIŞ %s: %s %s @ %s (~%.4f SWAP.HIVE)", SENT_WORD, buy_amount, symbol, buy_price, spend)
@@ -231,6 +261,7 @@ def place_quotes(market, wallet, symbol, mid_price, precision, quote_budget):
         if DRY_RUN:
             log.info("[DRY_RUN] SATIŞ %s %s @ %s SWAP.HIVE", sell_amount, symbol, sell_price)
         else:
+            pace()
             try:
                 tx = market.sell(HIVE_ACCOUNT, sell_amount, symbol, sell_price)
                 log.info("SATIŞ %s: %s %s @ %s", SENT_WORD, sell_amount, symbol, sell_price)
@@ -343,9 +374,9 @@ def run():
     log.info("Allowlist: %s", ", ".join(ALLOWLIST_BASE_SYMBOLS))
     if not DRY_RUN:
         if BUNDLE_MODE:
-            log.info("Bundle modu aktif: işlemler tek Hive transaction'ında gönderilecek (BEED ücreti gerekir).")
+            log.info("Bundle modu aktif: işlemler tek blokta gönderilecek; ilk işlem dışındakiler 0.001 BEED keser.")
         else:
-            log.info("Bundle kapalı: her işlem ayrı Hive transaction'ı olarak hemen gönderilecek.")
+            log.info("Bundle kapalı: her işlem ayrı Hive transaction'ı olarak, en az %.0f sn arayla gönderilecek.", SEND_DELAY_SECS)
 
     hive, api, market, wallet = load_clients()
     if not DRY_RUN:
