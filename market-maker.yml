@@ -1,0 +1,35 @@
+name: Hive Engine Market Maker
+
+on:
+  schedule:
+    # GitHub Actions cron'u dakikada bir garanti çalışmaz; 5 dakikada
+    # bir tetiklenmesi hedeflenir ama yoğunlukta gecikebilir.
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}   # Actions sekmesinden elle de tetiklenebilir
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4     # bir sonraki çalışmayla çakışmasın diye sınır
+
+    steps:
+      - name: Kodu al
+        uses: actions/checkout@v4
+
+      - name: Python kur
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Bağımlılıkları kur
+        run: pip install -r requirements.txt
+
+      - name: Botu çalıştır
+        env:
+          HIVE_ACCOUNT: ${{ secrets.HIVE_ACCOUNT }}
+          HIVE_ACTIVE_KEY: ${{ secrets.HIVE_ACTIVE_KEY }}
+          DRY_RUN: ${{ vars.DRY_RUN || 'true' }}
+          SPREAD_PCT: ${{ vars.SPREAD_PCT || '2.0' }}
+          ORDER_SIZE_QUOTE: ${{ vars.ORDER_SIZE_QUOTE || '1' }}
+          MAX_ALLOCATION_PCT: ${{ vars.MAX_ALLOCATION_PCT || '20' }}
+        run: python bot.py
