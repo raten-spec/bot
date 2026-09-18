@@ -10,15 +10,19 @@ Her çalıştırmada:
 Güvenlik notları (LÜTFEN OKUYUN):
   - DRY_RUN=true iken hiçbir gerçek emir gönderilmez, sadece ne
     yapılacağı loglanır. Varsayılan budur. Gerçek emir göndermek için
-    GitHub Secrets'ta DRY_RUN=false yapmanız gerekir.
+    GitHub'da Settings > Secrets and variables > Actions > VARIABLES
+    sekmesinde DRY_RUN=false yapmanız gerekir (Secrets değil).
   - Bot yalnızca ALLOWLIST içindeki sembollerle işlem yapar. Başka
     hiçbir token'a asla emir göndermez.
-  - Bakiyenizin MAX_ALLOCATION_PCT'ten fazlasını tek seferde
-    kullanmaz.
+  - Alış tarafında, TÜM semboller toplamda SWAP.HIVE bakiyenizin
+    MAX_ALLOCATION_PCT'sinden fazlasını kullanmaz (bütçe semboller
+    arasında eşit bölünür). Satış tarafında her sembol kendi
+    bakiyesinin MAX_ALLOCATION_PCT'sini satar.
 """
 
 import os
 import sys
+import math
 import logging
 
 logging.basicConfig(
@@ -28,14 +32,14 @@ logging.basicConfig(
 log = logging.getLogger("hive-mm-bot")
 
 # ---------------------------------------------------------------------------
-# Yapılandırma — tamamı ortam değişkeni / GitHub Secrets üzerinden ayarlanır
+# Yapılandırma — tamamı ortam değişkeni / GitHub Secrets & Variables üzerinden ayarlanır
 # ---------------------------------------------------------------------------
 
 HIVE_ACCOUNT = os.environ.get("HIVE_ACCOUNT", "").strip()
 HIVE_ACTIVE_KEY = os.environ.get("HIVE_ACTIVE_KEY", "").strip()
 DRY_RUN = os.environ.get("DRY_RUN", "true").strip().lower() != "false"
 SPREAD_PCT = float(os.environ.get("SPREAD_PCT", "2.0"))          # her yönde %
-ORDER_SIZE_QUOTE = float(os.environ.get("ORDER_SIZE_QUOTE", "1"))  # SWAP.HIVE cinsinden, işlem başına
+ORDER_SIZE_QUOTE = float(os.environ.get("ORDER_SIZE_QUOTE", "1"))  # SWAP.HIVE cinsinden, sembol başına üst sınır
 MAX_ALLOCATION_PCT = float(os.environ.get("MAX_ALLOCATION_PCT", "20"))  # bakiyenin en fazla %'si
 QUOTE_SYMBOL = "SWAP.HIVE"
 
@@ -55,12 +59,18 @@ def fail(msg):
     sys.exit(1)
 
 
+def floor_to(value, precision):
+    """Değeri aşağı yuvarlar (yukarı yuvarlayıp bütçeyi aşmamak için)."""
+    factor = 10 ** precision
+    return math.floor(value * factor + 1e-9) / factor
+
+
 def load_clients():
     """nectar/nectarengine bağlantısını kurar. Import burada yapılır ki
     eksik bağımlılıkta hata mesajı net olsun.
 
     bundle=True: bu Hive örneği üzerinden yapılan işlemler (cancel/buy/sell)
-    hemen zincire gönderilmez, kuyruğa eklenir. Tüm sembolller işlendikten
+    hemen zincire gönderilmez, kuyruğa eklenir. Tüm semboller işlendikten
     sonra tek bir hive.broadcast() çağrısıyla HEPSİ tek Hive transaction'ı
     olarak gönderilir.
 
@@ -129,8 +139,15 @@ def cancel_open_orders(market, wallet, symbol):
         except Exception as e:
             log.warning("%s emir defteri okunamadı (%s): %s", order_type, symbol, e)
             continue
-        for o in orders:
-            oid = o.get("_id") or o.get("txId")
+
+        log.info("%s için %d açık %s emri bulundu.", symbol, len(orders or []), order_type)
+
+        for o in orders or []:
+            # Hive Engine'in cancel işlemi emrin txId'sini bekler. _id yedek olarak kalıyor.
+            oid = o.get("txId") or o.get("_id")
+            if not oid:
+                log.warning("%s %s emrinde id bulunamadı, atlandı: %r", symbol, order_type, o)
+                continue
             if DRY_RUN:
                 log.info("[DRY_RUN] %s %s emri iptal edilirdi (id=%s)", symbol, order_type, oid)
                 continue
@@ -138,7 +155,7 @@ def cancel_open_orders(market, wallet, symbol):
                 market.cancel(HIVE_ACCOUNT, order_type, oid)
                 log.info("%s %s iptali kuyruğa eklendi (id=%s)", symbol, order_type, oid)
             except Exception as e:
-                log.warning("%s %s emri kuyruğa eklenemedi (id=%s): %s", symbol, order_type, oid, e)
+                log.warning("%s %s emri kuyruğa eklenemedi (id=%s): %r", symbol, order_type, oid, e)
 
 
 def get_balance(wallet, symbol):
@@ -152,18 +169,18 @@ def get_balance(wallet, symbol):
         return 0.0
 
 
-def place_quotes(market, wallet, symbol, mid_price, precision):
+def place_quotes(market, wallet, symbol, mid_price, precision, quote_budget):
+    """quote_budget: bu sembolün alış emri için harcayabileceği azami SWAP.HIVE."""
     buy_price = round(mid_price * (1 - SPREAD_PCT / 100.0), 8)
     sell_price = round(mid_price * (1 + SPREAD_PCT / 100.0), 8)
 
-    # Alış emri: ORDER_SIZE_QUOTE kadar SWAP.HIVE harcanır -> ne kadar `symbol` alınacağı hesaplanır
-    quote_balance = get_balance(wallet, QUOTE_SYMBOL)
-    spend = min(ORDER_SIZE_QUOTE, quote_balance * (MAX_ALLOCATION_PCT / 100.0))
-    buy_amount = round(spend / buy_price, precision) if buy_price > 0 else 0
+    # Alış emri: en fazla min(ORDER_SIZE_QUOTE, quote_budget) SWAP.HIVE harcanır
+    spend = min(ORDER_SIZE_QUOTE, quote_budget)
+    buy_amount = floor_to(spend / buy_price, precision) if buy_price > 0 else 0
 
-    # Satış emri: elinizdeki `symbol` bakiyesinin bir kısmı satılır
+    # Satış emri: elinizdeki `symbol` bakiyesinin MAX_ALLOCATION_PCT'si satılır
     base_balance = get_balance(wallet, symbol)
-    sell_amount = round(min(base_balance * (MAX_ALLOCATION_PCT / 100.0), base_balance), precision)
+    sell_amount = floor_to(base_balance * (MAX_ALLOCATION_PCT / 100.0), precision)
 
     if buy_amount > 0:
         if DRY_RUN:
@@ -171,11 +188,11 @@ def place_quotes(market, wallet, symbol, mid_price, precision):
         else:
             try:
                 market.buy(HIVE_ACCOUNT, buy_amount, symbol, buy_price)
-                log.info("ALIŞ kuyruğa eklendi: %s %s @ %s", buy_amount, symbol, buy_price)
+                log.info("ALIŞ kuyruğa eklendi: %s %s @ %s (~%.4f SWAP.HIVE)", buy_amount, symbol, buy_price, spend)
             except Exception as e:
-                log.error("Alış emri kuyruğa eklenemedi (%s): %s", symbol, e)
+                log.error("Alış emri kuyruğa eklenemedi (%s): %r", symbol, e)
     else:
-        log.info("%s için alış emri atlandı (yetersiz SWAP.HIVE bakiyesi ya da limit).", symbol)
+        log.info("%s için alış emri atlandı (bütçe/precision nedeniyle miktar 0).", symbol)
 
     if sell_amount > 0:
         if DRY_RUN:
@@ -185,9 +202,18 @@ def place_quotes(market, wallet, symbol, mid_price, precision):
                 market.sell(HIVE_ACCOUNT, sell_amount, symbol, sell_price)
                 log.info("SATIŞ kuyruğa eklendi: %s %s @ %s", sell_amount, symbol, sell_price)
             except Exception as e:
-                log.error("Satış emri kuyruğa eklenemedi (%s): %s", symbol, e)
+                log.error("Satış emri kuyruğa eklenemedi (%s): %r", symbol, e)
     else:
         log.info("%s için satış emri atlandı (yetersiz bakiye).", symbol)
+
+
+def pending_op_count(hive):
+    """Kuyruktaki işlem sayısını okumaya çalışır; okunamazsa None döner (tanı amaçlı)."""
+    try:
+        ops = getattr(getattr(hive, "txbuffer", None), "ops", None)
+        return None if ops is None else len(ops)
+    except Exception:
+        return None
 
 
 def run():
@@ -196,21 +222,31 @@ def run():
     if not DRY_RUN and not HIVE_ACTIVE_KEY:
         fail("DRY_RUN=false iken HIVE_ACTIVE_KEY zorunludur.")
 
-    log.info("Başlıyor. Hesap=%s DRY_RUN=%s SPREAD=%%%s ORDER_SIZE=%s SWAP.HIVE",
-              HIVE_ACCOUNT, DRY_RUN, SPREAD_PCT, ORDER_SIZE_QUOTE)
+    log.info("Başlıyor. Hesap=%s DRY_RUN=%s SPREAD=%%%s ORDER_SIZE=%s SWAP.HIVE MAX_ALLOC=%%%s",
+             HIVE_ACCOUNT, DRY_RUN, SPREAD_PCT, ORDER_SIZE_QUOTE, MAX_ALLOCATION_PCT)
     log.info("Allowlist: %s", ", ".join(ALLOWLIST_BASE_SYMBOLS))
     if not DRY_RUN:
         log.info("Bundle modu aktif: tüm semboller için işlemler tek Hive transaction'ında gönderilecek.")
 
     hive, api, market, wallet = load_clients()
     queued_any = False
+    failed = False
+
+    # Toplam alış bütçesi: SWAP.HIVE bakiyesinin MAX_ALLOCATION_PCT'si,
+    # semboller arasında eşit bölünür. Böylece tüm semboller birlikte bile
+    # bu sınırı aşmaz.
+    quote_balance = get_balance(wallet, QUOTE_SYMBOL)
+    total_budget = quote_balance * (MAX_ALLOCATION_PCT / 100.0)
+    per_symbol_budget = total_budget / max(len(ALLOWLIST_BASE_SYMBOLS), 1)
+    log.info("%s bakiyesi: %.4f | toplam alış bütçesi: %.4f | sembol başına: %.4f",
+             QUOTE_SYMBOL, quote_balance, total_budget, per_symbol_budget)
 
     for symbol in ALLOWLIST_BASE_SYMBOLS:
         log.info("--- %s/%s işleniyor ---", symbol, QUOTE_SYMBOL)
         try:
             mid = get_mid_price(api, symbol)
         except Exception as e:
-            log.error("%s için fiyat okunamadı: %s", symbol, e)
+            log.error("%s için fiyat okunamadı: %r", symbol, e)
             continue
 
         if mid is None or mid <= 0:
@@ -224,23 +260,36 @@ def run():
         # eklenir. Sıra korunur: bu sembol için iptaller, alış/satıştan
         # önce kuyruğa girer.
         cancel_open_orders(market, wallet, symbol)
-        place_quotes(market, wallet, symbol, mid, precision)
+        place_quotes(market, wallet, symbol, mid, precision, per_symbol_budget)
         queued_any = True
 
     if DRY_RUN:
         log.info("[DRY_RUN] Hiçbir şey zincire gönderilmedi.")
     elif queued_any:
+        count = pending_op_count(hive)
+        if count is not None:
+            log.info("Gönderim öncesi kuyrukta %d işlem var.", count)
+            if count == 0:
+                log.warning("Kuyruk boş görünüyor: market işlemleri bu Hive örneğinin "
+                            "kuyruğuna girmemiş olabilir. Yine de gönderim deneniyor.")
         log.info("Tüm semboller kuyruğa eklendi, tek transaction olarak gönderiliyor…")
         try:
             result = hive.broadcast()
             trx_id = result.get("trx_id") if isinstance(result, dict) else None
             log.info("Transaction gönderildi. trx_id=%s", trx_id)
+            log.info("Not: Hive Engine (sidechain) sonucu ayrıca doğrulanmalı; "
+                     "trx_id başarılı Hive girişi demektir, emirlerin kabulü değil.")
         except Exception as e:
-            log.error("Toplu transaction gönderilemedi: %s", e)
+            # log.exception tam traceback yazar; boş mesajlı istisnalarda da sebep görünür.
+            log.exception("Toplu transaction gönderilemedi: %r", e)
+            failed = True
     else:
         log.info("Kuyruğa eklenecek bir şey olmadı, transaction gönderilmedi.")
 
     log.info("Tamamlandı.")
+    if failed:
+        # Workflow'un kırmızı görünmesi için: sessiz başarısızlık olmasın.
+        sys.exit(1)
 
 
 if __name__ == "__main__":
